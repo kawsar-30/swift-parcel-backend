@@ -11,3 +11,4 @@ python-multipart==0.0.20
 slowapi==0.1.9
 email-validator
 requests
+reportlab
