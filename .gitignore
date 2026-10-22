@@ -1,0 +1,36 @@
+# Environment variables (Secret keys and DB passwords)
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Node.js (Frontend Dependencies)
+node_modules/
+frontend/node_modules/
+
+# Next.js build files
+.next/
+out/
+build/
+frontend/.next/
+
+# Python (Backend Virtual Environment & Cache)
+backend/venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Uploaded files (If any)
+backend/uploads/
+
+# Database files (Local SQLite/DB)
+*.sqlite3
+*.db
+
+# OS generated files
+.DS_Store
+Thumbs.db
