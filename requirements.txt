@@ -10,3 +10,4 @@ passlib[bcrypt]==1.7.4
 python-multipart==0.0.20
 slowapi==0.1.9
 email-validator
+requests
