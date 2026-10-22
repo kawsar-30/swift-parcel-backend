@@ -12,3 +12,4 @@ slowapi==0.1.9
 email-validator
 requests
 reportlab
+pandas
