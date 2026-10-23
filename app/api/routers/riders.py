@@ -258,29 +258,29 @@ async def rider_transfer_hub(
     return {"message": f"Parcel transferred to {hub.name}", "parcel_id": parcel.id}
 
 
+from sqlalchemy import case, func
+
 @router.get("/{rider_id}/details")
 async def get_rider_details(
     rider_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user = Depends(require_role("admin", "manager"))
 ):
-    # Prothome rider_id diye try koro
-    rider_res = await db.execute(select(Rider).where(Rider.id == rider_id))
-    rider = rider_res.scalar_one_or_none()
-    
-    # Jodi na pao, user_id diye try koro
-    if not rider:
-        rider_res = await db.execute(select(Rider).where(Rider.user_id == rider_id))
-        rider = rider_res.scalar_one_or_none()
-    
-    if not rider:
+    # 1. Rider & User Info (Single Query)
+    rider_query = (
+        select(Rider, User)
+        .join(User, Rider.user_id == User.id)
+        .where((Rider.id == rider_id) | (Rider.user_id == rider_id))
+    )
+    rider_res = await db.execute(rider_query)
+    rider_row = rider_res.first()
+    if not rider_row:
         raise HTTPException(404, "Rider not found")
+    
+    rider = rider_row.Rider
+    user = rider_row.User
 
-    # User info
-    user_res = await db.execute(select(User).where(User.id == rider.user_id))
-    user = user_res.scalar_one_or_none()
-
-    # Hub info
+    # 2. Hub Info (Single Query)
     hub_name = None
     hub_city = None
     if rider.hub_id:
@@ -290,36 +290,34 @@ async def get_rider_details(
             hub_name = hub.name
             hub_city = hub.city
 
-    # Stats
-    from sqlalchemy import func
-    total_tasks = await db.scalar(select(func.count(Parcel.id)).where(Parcel.assigned_rider_id == rider.id))
-    delivered_tasks = await db.scalar(select(func.count(Parcel.id)).where(
-        (Parcel.assigned_rider_id == rider.id) & (Parcel.status == "DELIVERED")
-    ))
-    pending_tasks = await db.scalar(select(func.count(Parcel.id)).where(
-        (Parcel.assigned_rider_id == rider.id) & (Parcel.status.in_(["PICKUP_ASSIGNED", "PICKED_UP", "OUT_FOR_DELIVERY"]))
-    ))
+    # 3. Task Stats (Single Query with aggregate)
+    stats_query = select(
+        func.count(Parcel.id).label("total"),
+        func.sum(case((Parcel.status == "DELIVERED", 1), else_=0)).label("delivered"),
+        func.sum(case((Parcel.status.in_(["PICKUP_ASSIGNED", "PICKED_UP", "OUT_FOR_DELIVERY"]), 1), else_=0)).label("pending")
+    ).where(Parcel.assigned_rider_id == rider.id)
+    
+    stats_res = await db.execute(stats_query)
+    stats_row = stats_res.first()
 
     return {
         "id": rider.id,
         "user_id": rider.user_id,
-        "name": user.name if user else "N/A",
-        "email": user.email if user else "N/A",
-        "phone": user.phone if user else None,
-        "profile_picture": user.profile_picture if user else None,
-        "nid_number": user.nid_number if user else None,
-        "address": user.address if user else None,
+        "name": user.name,
+        "email": user.email,
+        "phone": user.phone,
+        "profile_picture": user.profile_picture,
+        "nid_number": user.nid_number,
+        "address": user.address,
         "hub_name": hub_name,
         "hub_city": hub_city,
         "vehicle_type": rider.vehicle_type,
         "rider_type": rider.rider_type,
         "is_available": rider.is_available,
-        "total_tasks": total_tasks or 0,
-        "delivered_tasks": delivered_tasks or 0,
-        "pending_tasks": pending_tasks or 0,
+        "total_tasks": stats_row.total or 0,
+        "delivered_tasks": stats_row.delivered or 0,
+        "pending_tasks": stats_row.pending or 0,
     }
-
-
 
 @router.get("/me/stats")
 async def get_my_stats(

@@ -13,6 +13,7 @@ from app.models.rider import Rider
 from app.models.parcel import Parcel
 from sqlalchemy import func
 from app.schemas.hub import HubDetailsResponse
+from sqlalchemy import case
 
 router = APIRouter(prefix="/hubs", tags=["Hub Management"])
 
@@ -58,23 +59,22 @@ async def get_hub_details(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role("admin", "manager"))
 ):
-    # Hub check
-    hub_res = await db.execute(select(Hub).where(Hub.id == hub_id))
-    hub = hub_res.scalar_one_or_none()
-    if not hub:
+    # 1. Hub and Manager (Single Query)
+    hub_query = (
+        select(Hub, User.name.label("manager_name"), User.phone.label("manager_phone"))
+        .outerjoin(User, Hub.manager_id == User.id)
+        .where(Hub.id == hub_id)
+    )
+    hub_res = await db.execute(hub_query)
+    hub_row = hub_res.first()
+    if not hub_row:
         raise HTTPException(404, "Hub not found")
+    
+    hub = hub_row.Hub
+    manager_name = hub_row.manager_name
+    manager_phone = hub_row.manager_phone
 
-    # Manager details
-    manager_name = None
-    manager_phone = None
-    if hub.manager_id:
-        manager_res = await db.execute(select(User).where(User.id == hub.manager_id))
-        manager = manager_res.scalar_one_or_none()
-        if manager:
-            manager_name = manager.name
-            manager_phone = manager.phone
-
-    # Riders list (with user details)
+    # 2. Riders List (Single Query)
     riders_query = (
         select(Rider, User)
         .join(User, Rider.user_id == User.id)
@@ -82,7 +82,6 @@ async def get_hub_details(
     )
     riders_result = await db.execute(riders_query)
     riders_data = riders_result.all()
-
     riders_list = [
         {
             "id": r.Rider.id,
@@ -94,10 +93,15 @@ async def get_hub_details(
         for r in riders_data
     ]
 
-    # Parcels stats
-    total_parcels = await db.scalar(select(func.count(Parcel.id)).where(Parcel.hub_id == hub.id))
-    pending_parcels = await db.scalar(select(func.count(Parcel.id)).where(Parcel.hub_id == hub.id, Parcel.status.in_(["PENDING", "AT_HUB", "PICKUP_ASSIGNED"])))
-    delivered_parcels = await db.scalar(select(func.count(Parcel.id)).where(Parcel.hub_id == hub.id, Parcel.status == "DELIVERED"))
+    # 3. Parcels Stats (Single Query with aggregate)
+    stats_query = select(
+        func.count(Parcel.id).label("total"),
+        func.sum(case((Parcel.status.in_(["PENDING", "AT_HUB", "PICKUP_ASSIGNED"]), 1), else_=0)).label("pending"),
+        func.sum(case((Parcel.status == "DELIVERED", 1), else_=0)).label("delivered")
+    ).where(Parcel.hub_id == hub.id)
+    
+    stats_res = await db.execute(stats_query)
+    stats_row = stats_res.first()
 
     return {
         "id": hub.id,
@@ -107,8 +111,8 @@ async def get_hub_details(
         "manager_name": manager_name,
         "manager_phone": manager_phone,
         "riders_count": len(riders_list),
-        "riders": riders_list,  # <-- Notun add kora holo
-        "total_parcels": total_parcels or 0,
-        "pending_parcels": pending_parcels or 0,
-        "delivered_parcels": delivered_parcels or 0,
+        "riders": riders_list,
+        "total_parcels": stats_row.total or 0,
+        "pending_parcels": stats_row.pending or 0,
+        "delivered_parcels": stats_row.delivered or 0,
     }

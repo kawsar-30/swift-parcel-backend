@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
+from sqlalchemy.orm import selectinload
 import uuid
 from pydantic import BaseModel
 from typing import Optional
+from datetime import datetime, timedelta
 
 from app.database.database import get_db
 from app.models.parcel import Parcel
@@ -44,7 +46,7 @@ async def get_all_parcels(
     db: AsyncSession = Depends(get_db),
     current_user = Depends(require_role("admin", "manager"))
 ):
-    query = select(Parcel).order_by(Parcel.created_at.desc())
+    query = select(Parcel).options(selectinload(Parcel.items)).order_by(Parcel.created_at.desc())
     
     if current_user.role == "manager":
         hub_res = await db.execute(select(Hub).where(Hub.manager_id == current_user.id))
@@ -60,61 +62,53 @@ async def get_all_parcels(
         else:
             return {"data": [], "total": 0, "skip": skip, "limit": limit}
 
-    # মোট ডেটা কতটি তা বের করা (Pagination এর জন্য)
     count_query = select(func.count()).select_from(query.subquery())
     total = await db.scalar(count_query)
 
-    # Pagination Apply করা
     query = query.offset(skip).limit(limit)
     result = await db.execute(query)
     parcels = result.scalars().all()
 
+    if not parcels:
+        return {"data": [], "total": 0, "skip": skip, "limit": limit}
+
+    zone_ids = {p.pickup_zone_id for p in parcels if p.pickup_zone_id} | {p.delivery_zone_id for p in parcels if p.delivery_zone_id}
+    hub_ids = {p.pickup_hub_id for p in parcels if p.pickup_hub_id} | {p.delivery_hub_id for p in parcels if p.delivery_hub_id}
+    rider_ids = {p.assigned_rider_id for p in parcels if p.assigned_rider_id}
+    parcel_ids = [p.id for p in parcels]
+
+    zones_map = {}
+    if zone_ids:
+        z_res = await db.execute(select(Zone.id, Zone.name).where(Zone.id.in_(zone_ids)))
+        zones_map = {row.id: row.name for row in z_res.all()}
+
+    hubs_map = {}
+    if hub_ids:
+        h_res = await db.execute(select(Hub.id, Hub.name).where(Hub.id.in_(hub_ids)))
+        hubs_map = {row.id: row.name for row in h_res.all()}
+
+    riders_map = {}
+    if rider_ids:
+        r_res = await db.execute(
+            select(Rider.id, User.name)
+            .join(User, Rider.user_id == User.id)
+            .where(Rider.id.in_(rider_ids))
+        )
+        riders_map = {row.id: row.name for row in r_res.all()}
+
+    payments_map = {}
+    if parcel_ids:
+        p_res = await db.execute(
+            select(Payment.parcel_id, Payment.status)
+            .where(Payment.parcel_id.in_(parcel_ids))
+            .order_by(Payment.created_at.desc())
+        )
+        for p_id, p_status in p_res.all():
+            if p_id not in payments_map:
+                payments_map[p_id] = p_status
+
     response_data = []
     for p in parcels:
-        pickup_zone_name = None
-        delivery_zone_name = None
-        pickup_hub_name = None
-        delivery_hub_name = None
-        rider_name = None
-
-        if p.pickup_zone_id:
-            zone_res = await db.execute(select(Zone).where(Zone.id == p.pickup_zone_id))
-            pickup_zone = zone_res.scalar_one_or_none()
-            pickup_zone_name = pickup_zone.name if pickup_zone else None
-        
-        if p.delivery_zone_id:
-            zone_res = await db.execute(select(Zone).where(Zone.id == p.delivery_zone_id))
-            delivery_zone = zone_res.scalar_one_or_none()
-            delivery_zone_name = delivery_zone.name if delivery_zone else None
-
-        if p.pickup_hub_id:
-            hub_res = await db.execute(select(Hub).where(Hub.id == p.pickup_hub_id))
-            pickup_hub = hub_res.scalar_one_or_none()
-            pickup_hub_name = pickup_hub.name if pickup_hub else None
-
-        if p.delivery_hub_id:
-            hub_res = await db.execute(select(Hub).where(Hub.id == p.delivery_hub_id))
-            delivery_hub = hub_res.scalar_one_or_none()
-            delivery_hub_name = delivery_hub.name if delivery_hub else None
-
-        if p.assigned_rider_id:
-            rider_res = await db.execute(select(Rider).where(Rider.id == p.assigned_rider_id))
-            rider = rider_res.scalar_one_or_none()
-            if rider:
-                user_res = await db.execute(select(User).where(User.id == rider.user_id))
-                user = user_res.scalar_one_or_none()
-                if user:
-                    rider_name = user.name
-
-        payment_res = await db.execute(
-            select(Payment)
-            .where(Payment.parcel_id == p.id)
-            .order_by(Payment.created_at.desc())
-            .limit(1)
-        )
-        payment = payment_res.scalar_one_or_none()
-        payment_status = payment.status if payment else None
-
         response_data.append({
             "id": p.id,
             "tracking_id": p.tracking_id,
@@ -134,11 +128,11 @@ async def get_all_parcels(
             "status": p.status,
             "created_at": p.created_at,
             "assigned_rider_id": p.assigned_rider_id,
-            "assigned_rider_name": rider_name,
+            "assigned_rider_name": riders_map.get(p.assigned_rider_id),
             "hub_id": p.hub_id,
             "pickup_hub_id": p.pickup_hub_id,
             "delivery_hub_id": p.delivery_hub_id,
-            "payment_status": payment_status,
+            "payment_status": payments_map.get(p.id),
             "items": [
                 {
                     "id": item.id,
@@ -147,10 +141,10 @@ async def get_all_parcels(
                     "unit_price": item.unit_price
                 } for item in p.items
             ] if p.items else [],
-            "pickup_zone_name": pickup_zone_name,
-            "delivery_zone_name": delivery_zone_name,
-            "pickup_hub_name": pickup_hub_name,
-            "delivery_hub_name": delivery_hub_name,
+            "pickup_zone_name": zones_map.get(p.pickup_zone_id),
+            "delivery_zone_name": zones_map.get(p.delivery_zone_id),
+            "pickup_hub_name": hubs_map.get(p.pickup_hub_id),
+            "delivery_hub_name": hubs_map.get(p.delivery_hub_id),
         })
 
     return {
@@ -214,7 +208,6 @@ async def update_parcel_status(
                 parcel.hub_id = hub.id
 
     if data.status == "DELIVERED":
-        from datetime import datetime
         parcel.delivered_at = datetime.utcnow()
 
     parcel.status = data.status
@@ -312,14 +305,12 @@ async def get_all_users(
             )
     
     if current_user.role == "manager" and role == "rider":
-        hub_res = await db.execute(select(Hub).where(Hub.manager_id == current_user.id))
-        hub = hub_res.scalar_one_or_none()
-        if hub:
-            rider_res = await db.execute(select(Rider.user_id).where(Rider.hub_id == hub.id))
-            rider_user_ids = [r[0] for r in rider_res.fetchall()]
-            query = query.where(User.id.in_(rider_user_ids))
-        else:
-            return {"data": [], "total": 0}
+        hub_rider_subquery = (
+            select(Rider.user_id)
+            .join(Hub, Hub.id == Rider.hub_id)
+            .where(Hub.manager_id == current_user.id)
+        )
+        query = query.where(User.id.in_(hub_rider_subquery))
     
     count_query = select(func.count()).select_from(query.subquery())
     total = await db.scalar(count_query)
@@ -560,4 +551,92 @@ async def get_admin_stats(
         "delivered": delivered or 0,
         "pending": pending or 0,
         "total_revenue": revenue or 0
+    }
+
+# --- Combined Dashboard Stats API (নতুন ও সবচেয়ে গুরুত্বপূর্ণ) ---
+@router.get("/dashboard-stats")
+async def get_dashboard_combined_stats(
+    days: int = 7,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(require_role("admin", "manager"))
+):
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=days)
+    
+    hub_id = None
+    if current_user.role == "manager":
+        hub_res = await db.execute(select(Hub).where(Hub.manager_id == current_user.id))
+        hub = hub_res.scalar_one_or_none()
+        if hub:
+            hub_id = hub.id
+        else:
+            return {"stats": {}, "daily_volume": [], "daily_revenue": [], "success_rate": {}, "top_cities": []}
+
+    # 1. Base Stats
+    stats_query = select(
+        func.count(Parcel.id).label("total"),
+        func.sum(case((Parcel.status == "DELIVERED", 1), else_=0)).label("delivered"),
+        func.sum(case((Parcel.status.in_(["PENDING", "PICKUP_ASSIGNED", "AT_HUB"]), 1), else_=0)).label("pending"),
+        func.sum(case((Parcel.status == "DELIVERED", Parcel.total_amount), else_=0)).label("revenue")
+    )
+    if hub_id:
+        stats_query = stats_query.where(
+            (Parcel.pickup_hub_id == hub_id) | (Parcel.delivery_hub_id == hub_id)
+        )
+    stats_res = await db.execute(stats_query)
+    stats_row = stats_res.first()
+
+    # 2. Daily Volume
+    vol_query = select(
+        func.date(Parcel.created_at).label("date"),
+        func.count(Parcel.id).label("count")
+    ).where(Parcel.created_at >= start_date, Parcel.created_at < end_date)
+    if hub_id:
+        vol_query = vol_query.where((Parcel.pickup_hub_id == hub_id) | (Parcel.delivery_hub_id == hub_id))
+    vol_query = vol_query.group_by(func.date(Parcel.created_at)).order_by(func.date(Parcel.created_at).asc())
+    vol_res = await db.execute(vol_query)
+    daily_volume = [{"date": str(row.date), "count": row.count} for row in vol_res.all()]
+
+    # 3. Daily Revenue
+    rev_query = select(
+        func.date(Parcel.created_at).label("date"),
+        func.sum(Parcel.total_amount).label("revenue")
+    ).where(Parcel.created_at >= start_date, Parcel.created_at < end_date)
+    if hub_id:
+        rev_query = rev_query.where((Parcel.pickup_hub_id == hub_id) | (Parcel.delivery_hub_id == hub_id))
+    rev_query = rev_query.group_by(func.date(Parcel.created_at)).order_by(func.date(Parcel.created_at).asc())
+    rev_res = await db.execute(rev_query)
+    daily_revenue = [{"date": str(row.date), "revenue": float(row.revenue or 0)} for row in rev_res.all()]
+
+    # 4. Success Rate
+    total = stats_row.total or 0
+    delivered = stats_row.delivered or 0
+    success_rate = {
+        "total_parcels": total,
+        "delivered_parcels": delivered,
+        "success_rate": round((delivered / total * 100), 2) if total > 0 else 0.0
+    }
+
+    # 5. Top Cities
+    city_query = select(
+        Parcel.delivery_city.label("city"),
+        func.count(Parcel.id).label("count")
+    )
+    if hub_id:
+        city_query = city_query.where((Parcel.pickup_hub_id == hub_id) | (Parcel.delivery_hub_id == hub_id))
+    city_query = city_query.group_by(Parcel.delivery_city).order_by(func.count(Parcel.id).desc()).limit(5)
+    city_res = await db.execute(city_query)
+    top_cities = [{"city": row.city, "count": row.count} for row in city_res.all()]
+
+    return {
+        "stats": {
+            "total_parcels": total,
+            "delivered": delivered,
+            "pending": stats_row.pending or 0,
+            "total_revenue": float(stats_row.revenue or 0)
+        },
+        "daily_volume": daily_volume,
+        "daily_revenue": daily_revenue,
+        "success_rate": success_rate,
+        "top_cities": top_cities
     }
